@@ -70,10 +70,6 @@ func (c *connection) closeBuffer() {
 
 // inputs implements FDOperator.
 func (c *connection) inputs(vs [][]byte) (rs [][]byte) {
-	if !c.lock(reading) {
-		return rs
-	}
-
 	n := int(atomic.LoadInt32(&c.waitReadSize))
 	if n <= pagesize {
 		return c.inputBuffer.Book(pagesize, vs)
@@ -93,7 +89,7 @@ func (c *connection) inputAck(n int) (err error) {
 	}
 	lack := atomic.AddInt32(&c.waitReadSize, int32(-n))
 	err = c.inputBuffer.BookAck(n, lack <= 0)
-	c.unlock(reading)
+	//c.unlock(reading)
 	c.triggerRead()
 	c.onRequest()
 	return err
