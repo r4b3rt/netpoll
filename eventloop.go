@@ -1,4 +1,4 @@
-// Copyright 2021 CloudWeGo Authors
+// Copyright 2022 CloudWeGo Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,16 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build darwin || netbsd || freebsd || openbsd || dragonfly || linux
-// +build darwin netbsd freebsd openbsd dragonfly linux
-
 package netpoll
 
 import (
 	"context"
 	"net"
-	"runtime"
-	"sync"
 )
 
 // A EventLoop is a network server.
@@ -38,6 +33,20 @@ type EventLoop interface {
 	// but will not force the closing of connections in progress.
 	Shutdown(ctx context.Context) error
 }
+
+/* The Connection Callback Sequence Diagram
+| Connection State                     | Callback Function | Notes
+|   Connected but not initialized      |    OnPrepare      | Conn is not registered into poller
+|   Connected and initialized          |    OnConnect      | Conn is ready for read or write
+|   Read first byte                    |    OnRequest      | Conn is ready for read or write
+|   Peer closed but conn is active     |    OnDisconnect   | Conn access will race with OnRequest function
+|   Self closed and conn is closed     |    CloseCallback  | Conn is destroyed
+
+Execution Order:
+  OnPrepare => OnConnect => OnRequest      => CloseCallback
+                            OnDisconnect
+Note: only OnRequest and OnDisconnect will be executed in parallel
+*/
 
 // OnPrepare is used to inject custom preparation at connection initialization,
 // which is optional but important in some scenarios. For example, a qps limiter
@@ -59,14 +68,20 @@ type OnPrepare func(connection Connection) context.Context
 //
 // An example usage in TCP Proxy scenario:
 //
-//  func onConnect(ctx context.Context, upstream netpoll.Connection) context.Context {
-//	  downstream, _ := netpoll.DialConnection("tcp", downstreamAddr, time.Second)
-//	  return context.WithValue(ctx, downstreamKey, downstream)
-//  }
-//  func onRequest(ctx context.Context, upstream netpoll.Connection) error {
-//    downstream := ctx.Value(downstreamKey).(netpoll.Connection)
-//  }
+//	func onConnect(ctx context.Context, upstream netpoll.Connection) context.Context {
+//		downstream, _ := netpoll.DialConnection("tcp", downstreamAddr, time.Second)
+//		return context.WithValue(ctx, downstreamKey, downstream)
+//	}
+//
+//	func onRequest(ctx context.Context, upstream netpoll.Connection) error {
+//		downstream := ctx.Value(downstreamKey).(netpoll.Connection)
+//	}
 type OnConnect func(ctx context.Context, connection Connection) context.Context
+
+// OnDisconnect is called once connection is going to be closed.
+// OnDisconnect must return as quick as possible because it will block poller.
+// OnDisconnect is different from CloseCallback, you could check with "The Connection Callback Sequence Diagram" section.
+type OnDisconnect func(ctx context.Context, connection Connection)
 
 // OnRequest defines the function for handling connection. When data is sent from the connection peer,
 // netpoll actively reads the data in LT mode and places it in the connection's input buffer.
@@ -75,7 +90,7 @@ type OnConnect func(ctx context.Context, connection Connection) context.Context
 //	func OnRequest(ctx context, connection Connection) error {
 //		input := connection.Reader().Next(n)
 //		handling input data...
-//  	send, _ := connection.Writer().Malloc(l)
+//		send, _ := connection.Writer().Malloc(l)
 //		copy(send, output)
 //		connection.Flush()
 //		return nil
@@ -97,67 +112,3 @@ type OnConnect func(ctx context.Context, connection Connection) context.Context
 //
 // Return: error is unused which will be ignored directly.
 type OnRequest func(ctx context.Context, connection Connection) error
-
-// NewEventLoop .
-func NewEventLoop(onRequest OnRequest, ops ...Option) (EventLoop, error) {
-	opts := &options{
-		onRequest: onRequest,
-	}
-	for _, do := range ops {
-		do.f(opts)
-	}
-	return &eventLoop{
-		opts: opts,
-		stop: make(chan error, 1),
-	}, nil
-}
-
-type eventLoop struct {
-	sync.Mutex
-	opts *options
-	svr  *server
-	stop chan error
-}
-
-// Serve implements EventLoop.
-func (evl *eventLoop) Serve(ln net.Listener) error {
-	npln, err := ConvertListener(ln)
-	if err != nil {
-		return err
-	}
-	evl.Lock()
-	evl.svr = newServer(npln, evl.opts, evl.quit)
-	evl.svr.Run()
-	evl.Unlock()
-
-	err = evl.waitQuit()
-	// ensure evl will not be finalized until Serve returns
-	runtime.SetFinalizer(evl, nil)
-	return err
-}
-
-// Shutdown signals a shutdown a begins server closing.
-func (evl *eventLoop) Shutdown(ctx context.Context) error {
-	evl.Lock()
-	var svr = evl.svr
-	evl.svr = nil
-	evl.Unlock()
-
-	if svr == nil {
-		return nil
-	}
-	evl.quit(nil)
-	return svr.Close(ctx)
-}
-
-// waitQuit waits for a quit signal
-func (evl *eventLoop) waitQuit() error {
-	return <-evl.stop
-}
-
-func (evl *eventLoop) quit(err error) {
-	select {
-	case evl.stop <- err:
-	default:
-	}
-}

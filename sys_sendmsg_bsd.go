@@ -1,4 +1,4 @@
-// Copyright 2021 CloudWeGo Authors
+// Copyright 2022 CloudWeGo Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build darwin || dragonfly || freebsd || netbsd || openbsd
 // +build darwin dragonfly freebsd netbsd openbsd
 
 package netpoll
@@ -30,12 +31,13 @@ func sendmsg(fd int, bs [][]byte, ivs []syscall.Iovec, zerocopy bool) (n int, er
 	if iovLen == 0 {
 		return 0, nil
 	}
-	var msghdr = syscall.Msghdr{
+	msghdr := syscall.Msghdr{
 		Iov:    &ivs[0],
 		Iovlen: int32(iovLen),
 	}
 	// flags = syscall.MSG_DONTWAIT
 	r, _, e := syscall.RawSyscall(syscall.SYS_SENDMSG, uintptr(fd), uintptr(unsafe.Pointer(&msghdr)), uintptr(0))
+	resetIovecs(bs, ivs[:iovLen])
 	if e != 0 {
 		return int(r), syscall.Errno(e)
 	}

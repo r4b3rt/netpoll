@@ -1,4 +1,4 @@
-// Copyright 2021 CloudWeGo Authors
+// Copyright 2022 CloudWeGo Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package netpoll
 
 import (
 	"fmt"
+	"net"
 	"syscall"
 )
 
@@ -23,9 +24,9 @@ import (
 const (
 	// The connection closed when in use.
 	ErrConnClosed = syscall.Errno(0x101)
-	// read I/O buffer timeout, calling by Connection.Reader
+	// Read I/O buffer timeout, calling by Connection.Reader
 	ErrReadTimeout = syscall.Errno(0x102)
-	// dial timeout
+	// Dial timeout
 	ErrDialTimeout = syscall.Errno(0x103)
 	// Calling dialer without timeout.
 	ErrDialNoDeadline = syscall.Errno(0x104) // TODO: no-deadline support in future
@@ -33,13 +34,17 @@ const (
 	ErrUnsupported = syscall.Errno(0x105)
 	// Same as io.EOF
 	ErrEOF = syscall.Errno(0x106)
+	// Write I/O buffer timeout, calling by Connection.Writer
+	ErrWriteTimeout = syscall.Errno(0x107)
+	// Concurrent connection access error
+	ErrConcurrentAccess = syscall.Errno(0x108)
 )
 
 const ErrnoMask = 0xFF
 
 // wrap Errno, implement xerrors.Wrapper
 func Exception(err error, suffix string) error {
-	var no, ok = err.(syscall.Errno)
+	no, ok := err.(syscall.Errno)
 	if !ok {
 		if suffix == "" {
 			return err
@@ -48,6 +53,8 @@ func Exception(err error, suffix string) error {
 	}
 	return &exception{no: no, suffix: suffix}
 }
+
+var _ net.Error = (*exception)(nil)
 
 type exception struct {
 	no     syscall.Errno
@@ -86,12 +93,26 @@ func (e *exception) Unwrap() error {
 	return e.no
 }
 
+func (e *exception) Timeout() bool {
+	switch e.no {
+	case ErrDialTimeout, ErrReadTimeout, ErrWriteTimeout:
+		return true
+	}
+	return e.no.Timeout()
+}
+
+func (e *exception) Temporary() bool {
+	return e.no.Temporary()
+}
+
 // Errors defined in netpoll
 var errnos = [...]string{
-	ErrnoMask & ErrConnClosed:     "connection has been closed",
-	ErrnoMask & ErrReadTimeout:    "connection read timeout",
-	ErrnoMask & ErrDialTimeout:    "dial wait timeout",
-	ErrnoMask & ErrDialNoDeadline: "dial no deadline",
-	ErrnoMask & ErrUnsupported:    "netpoll dose not support",
-	ErrnoMask & ErrEOF:            "EOF",
+	ErrnoMask & ErrConnClosed:       "connection has been closed",
+	ErrnoMask & ErrReadTimeout:      "connection read timeout",
+	ErrnoMask & ErrDialTimeout:      "dial wait timeout",
+	ErrnoMask & ErrDialNoDeadline:   "dial no deadline",
+	ErrnoMask & ErrUnsupported:      "netpoll does not support",
+	ErrnoMask & ErrEOF:              "EOF",
+	ErrnoMask & ErrWriteTimeout:     "connection write timeout",
+	ErrnoMask & ErrConcurrentAccess: "concurrent connection access",
 }

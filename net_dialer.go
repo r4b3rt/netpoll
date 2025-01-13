@@ -1,4 +1,4 @@
-// Copyright 2021 CloudWeGo Authors
+// Copyright 2022 CloudWeGo Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !windows
+// +build !windows
+
 package netpoll
 
 import (
@@ -20,18 +23,25 @@ import (
 	"time"
 )
 
-// Dialer extends net.Dialer's API, just for interface compatibility.
-// DialConnection is recommended, but of course all functions are practically the same.
-// The returned net.Conn can be directly asserted as Connection if error is nil.
-type Dialer interface {
-	DialConnection(network, address string, timeout time.Duration) (connection Connection, err error)
-
-	DialTimeout(network, address string, timeout time.Duration) (conn net.Conn, err error)
-}
-
 // DialConnection is a default implementation of Dialer.
 func DialConnection(network, address string, timeout time.Duration) (connection Connection, err error) {
 	return defaultDialer.DialConnection(network, address, timeout)
+}
+
+// NewFDConnection create a Connection initialed by any fd
+// It's useful for write unit test for functions have args with the type of netpoll.Connection
+// The typical usage like:
+//
+//	rfd, wfd := netpoll.GetSysFdPairs()
+//	rconn, _ = netpoll.NewFDConnection(rfd)
+//	wconn, _ = netpoll.NewFDConnection(wfd)
+func NewFDConnection(fd int) (Connection, error) {
+	conn := new(connection)
+	err := conn.init(&netFD{fd: fd}, nil)
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 
 // NewDialer only support TCP and unix socket now.
@@ -45,8 +55,7 @@ type dialer struct{}
 
 // DialTimeout implements Dialer.
 func (d *dialer) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
-	conn, err := d.DialConnection(network, address, timeout)
-	return conn, err
+	return d.DialConnection(network, address, timeout)
 }
 
 // DialConnection implements Dialer.
@@ -60,24 +69,69 @@ func (d *dialer) DialConnection(network, address string, timeout time.Duration) 
 
 	switch network {
 	case "tcp", "tcp4", "tcp6":
-		var raddr *TCPAddr
-		raddr, err = ResolveTCPAddr(network, address)
-		if err != nil {
-			return nil, err
-		}
-		connection, err = DialTCP(ctx, network, nil, raddr)
-	// case "udp", "udp4", "udp6":  // TODO: unsupport now
+		return d.dialTCP(ctx, network, address)
+	// case "udp", "udp4", "udp6":  // TODO: unsupported now
 	case "unix", "unixgram", "unixpacket":
-		var raddr *UnixAddr
-		raddr, err = ResolveUnixAddr(network, address)
-		if err != nil {
-			return nil, err
+		raddr := &UnixAddr{
+			UnixAddr: net.UnixAddr{Name: address, Net: network},
 		}
-		connection, err = DialUnix(network, nil, raddr)
+		return DialUnix(network, nil, raddr)
 	default:
 		return nil, net.UnknownNetworkError(network)
 	}
-	return connection, err
+}
+
+func (d *dialer) dialTCP(ctx context.Context, network, address string) (connection *TCPConnection, err error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	var portnum int
+	if portnum, err = net.DefaultResolver.LookupPort(ctx, network, port); err != nil {
+		return nil, err
+	}
+	var ipaddrs []net.IPAddr
+	// host maybe empty if address is :12345
+	if host == "" {
+		ipaddrs = []net.IPAddr{{}}
+	} else {
+		ipaddrs, err = net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		if len(ipaddrs) == 0 {
+			return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+		}
+	}
+
+	var firstErr error // The error from the first address is most relevant.
+	tcpAddr := &TCPAddr{}
+	for _, ipaddr := range ipaddrs {
+		tcpAddr.IP = ipaddr.IP
+		tcpAddr.Port = portnum
+		tcpAddr.Zone = ipaddr.Zone
+		if ipaddr.IP != nil && ipaddr.IP.To4() == nil {
+			connection, err = DialTCP(ctx, "tcp6", nil, tcpAddr)
+		} else {
+			connection, err = DialTCP(ctx, "tcp", nil, tcpAddr)
+		}
+		if err == nil {
+			return connection, nil
+		}
+		select {
+		case <-ctx.Done(): // check timeout error
+			return nil, err
+		default:
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	if firstErr == nil {
+		firstErr = &net.OpError{Op: "dial", Net: network, Source: nil, Addr: nil, Err: errMissingAddress}
+	}
+	return nil, firstErr
 }
 
 // sysDialer contains a Dial's parameters and configuration.
