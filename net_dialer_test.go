@@ -1,4 +1,4 @@
-// Copyright 2021 CloudWeGo Authors
+// Copyright 2022 CloudWeGo Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
+//go:build !windows
+// +build !windows
 
 package netpoll
 
@@ -28,11 +31,12 @@ import (
 
 func TestDialerTCP(t *testing.T) {
 	dialer := NewDialer()
-	conn, err := dialer.DialTimeout("tcp", ":1234", time.Second)
+	address := getTestAddress()
+	conn, err := dialer.DialTimeout("tcp", address, time.Second)
 	MustTrue(t, err != nil)
 	MustTrue(t, conn.(*TCPConnection) == nil)
 
-	ln, err := CreateListener("tcp", ":1234")
+	ln, err := CreateListener("tcp", address)
 	MustNil(t, err)
 
 	stop := make(chan int, 1)
@@ -54,10 +58,10 @@ func TestDialerTCP(t *testing.T) {
 		}
 	}()
 
-	conn, err = dialer.DialTimeout("tcp", ":1234", time.Second)
+	conn, err = dialer.DialTimeout("tcp", address, time.Second)
 	MustNil(t, err)
 	MustTrue(t, strings.HasPrefix(conn.LocalAddr().String(), "127.0.0.1:"))
-	Equal(t, conn.RemoteAddr().String(), "127.0.0.1:1234")
+	Equal(t, conn.RemoteAddr().String(), address)
 }
 
 func TestDialerUnix(t *testing.T) {
@@ -103,7 +107,8 @@ func TestDialerUnix(t *testing.T) {
 }
 
 func TestDialerFdAlloc(t *testing.T) {
-	ln, err := CreateListener("tcp", ":1234")
+	address := getTestAddress()
+	ln, err := CreateListener("tcp", address)
 	MustNil(t, err)
 	defer ln.Close()
 	el1, _ := NewEventLoop(func(ctx context.Context, connection Connection) error {
@@ -113,12 +118,12 @@ func TestDialerFdAlloc(t *testing.T) {
 	go func() {
 		el1.Serve(ln)
 	}()
-	var ctx1, cancel1 = context.WithTimeout(context.Background(), time.Second)
+	ctx1, cancel1 := context.WithTimeout(context.Background(), time.Second)
 	defer cancel1()
 	defer el1.Shutdown(ctx1)
 
 	for i := 0; i < 100; i++ {
-		conn, err := DialConnection("tcp", ":1234", time.Second)
+		conn, err := DialConnection("tcp", address, time.Second)
 		MustNil(t, err)
 		fd := conn.(*TCPConnection).fd
 		conn.Write([]byte("hello world"))
@@ -131,7 +136,8 @@ func TestDialerFdAlloc(t *testing.T) {
 }
 
 func TestFDClose(t *testing.T) {
-	ln, err := CreateListener("tcp", ":1234")
+	address := getTestAddress()
+	ln, err := CreateListener("tcp", address)
 	MustNil(t, err)
 	defer ln.Close()
 	el1, _ := NewEventLoop(func(ctx context.Context, connection Connection) error {
@@ -141,19 +147,19 @@ func TestFDClose(t *testing.T) {
 	go func() {
 		el1.Serve(ln)
 	}()
-	var ctx1, cancel1 = context.WithTimeout(context.Background(), time.Second)
+	ctx1, cancel1 := context.WithTimeout(context.Background(), time.Second)
 	defer cancel1()
 	defer el1.Shutdown(ctx1)
 
 	var fd int
 	var conn Connection
-	conn, err = DialConnection("tcp", ":1234", time.Second)
+	conn, err = DialConnection("tcp", address, time.Second)
 	MustNil(t, err)
 	fd = conn.(*TCPConnection).fd
 	syscall.SetNonblock(fd, true)
 	conn.Close()
 
-	conn, err = DialConnection("tcp", ":1234", time.Second)
+	conn, err = DialConnection("tcp", address, time.Second)
 	MustNil(t, err)
 	fd = conn.(*TCPConnection).fd
 	syscall.SetNonblock(fd, true)
@@ -163,23 +169,25 @@ func TestFDClose(t *testing.T) {
 
 // fd data package race test, use two servers and two dialers.
 func TestDialerThenClose(t *testing.T) {
+	address1 := getTestAddress()
+	address2 := getTestAddress()
 	// server 1
-	ln1, _ := CreateListener("tcp", ":1231")
+	ln1, _ := createTestListener("tcp", address1)
 	el1 := mockDialerEventLoop(1)
 	go func() {
 		el1.Serve(ln1)
 	}()
-	var ctx1, cancel1 = context.WithTimeout(context.Background(), time.Second)
+	ctx1, cancel1 := context.WithTimeout(context.Background(), time.Second)
 	defer cancel1()
 	defer el1.Shutdown(ctx1)
 
 	// server 2
-	ln2, _ := CreateListener("tcp", ":1232")
+	ln2, _ := createTestListener("tcp", address2)
 	el2 := mockDialerEventLoop(2)
 	go func() {
 		el2.Serve(ln2)
 	}()
-	var ctx2, cancel2 = context.WithTimeout(context.Background(), time.Second)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
 	defer cancel2()
 	defer el2.Shutdown(ctx2)
 
@@ -191,12 +199,12 @@ func TestDialerThenClose(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < 50; i++ {
 				// send server 1
-				conn, err := DialConnection("tcp", ":1231", time.Second)
+				conn, err := DialConnection("tcp", address1, time.Second)
 				if err == nil {
 					mockDialerSend(1, &conn.(*TCPConnection).connection)
 				}
 				// send server 2
-				conn, err = DialConnection("tcp", ":1232", time.Second)
+				conn, err = DialConnection("tcp", address2, time.Second)
 				if err == nil {
 					mockDialerSend(2, &conn.(*TCPConnection).connection)
 				}
@@ -204,6 +212,21 @@ func TestDialerThenClose(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestNewFDConnection(t *testing.T) {
+	r, w := GetSysFdPairs()
+	rconn, err := NewFDConnection(r)
+	MustNil(t, err)
+	wconn, err := NewFDConnection(w)
+	MustNil(t, err)
+	_, err = rconn.Writer().WriteString("hello")
+	MustNil(t, err)
+	err = rconn.Writer().Flush()
+	MustNil(t, err)
+	buf, err := wconn.Reader().Next(5)
+	MustNil(t, err)
+	Equal(t, string(buf), "hello")
 }
 
 func mockDialerEventLoop(idx int) EventLoop {

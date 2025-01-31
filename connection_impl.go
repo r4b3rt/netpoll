@@ -1,4 +1,4 @@
-// Copyright 2021 CloudWeGo Authors
+// Copyright 2022 CloudWeGo Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !windows
+// +build !windows
+
 package netpoll
 
 import (
@@ -21,8 +24,14 @@ import (
 	"time"
 )
 
+type connState = int32
+
 const (
 	defaultZeroCopyTimeoutSec = 60
+
+	connStateNone         = 0
+	connStateConnected    = 1
+	connStateDisconnected = 2
 )
 
 // connection is the implement of Connection
@@ -33,21 +42,25 @@ type connection struct {
 	operator        *FDOperator
 	readTimeout     time.Duration
 	readTimer       *time.Timer
-	readTrigger     chan struct{}
-	waitReadSize    int32
+	readTrigger     chan error
+	waitReadSize    int64
+	writeTimeout    time.Duration
+	writeTimer      *time.Timer
 	writeTrigger    chan error
 	inputBuffer     *LinkBuffer
 	outputBuffer    *LinkBuffer
-	inputBarrier    *barrier
 	outputBarrier   *barrier
 	supportZeroCopy bool
-	maxSize         int // The maximum size of data between two Release().
-	bookSize        int // The size of data that can be read at once.
+	maxSize         int       // The maximum size of data between two Release().
+	bookSize        int       // The size of data that can be read at once.
+	state           connState // Connection state should be changed sequentially.
 }
 
-var _ Connection = &connection{}
-var _ Reader = &connection{}
-var _ Writer = &connection{}
+var (
+	_ Connection = &connection{}
+	_ Reader     = &connection{}
+	_ Writer     = &connection{}
+)
 
 // Reader implements Connection.
 func (c *connection) Reader() Reader {
@@ -76,6 +89,14 @@ func (c *connection) SetIdleTimeout(timeout time.Duration) error {
 func (c *connection) SetReadTimeout(timeout time.Duration) error {
 	if timeout >= 0 {
 		c.readTimeout = timeout
+	}
+	return nil
+}
+
+// SetWriteTimeout implements Connection.
+func (c *connection) SetWriteTimeout(timeout time.Duration) error {
+	if timeout >= 0 {
+		c.writeTimeout = timeout
 	}
 	return nil
 }
@@ -155,7 +176,7 @@ func (c *connection) Until(delim byte) (line []byte, err error) {
 		l = c.inputBuffer.Len()
 		i := c.inputBuffer.indexByte(delim, n)
 		if i < 0 {
-			n = l //skip all exists bytes
+			n = l // skip all exists bytes
 			continue
 		}
 		return c.Next(i + 1)
@@ -205,10 +226,15 @@ func (c *connection) MallocLen() (length int) {
 // If empty, it will call syscall.Write to send data directly,
 // otherwise the buffer will be sent asynchronously by the epoll trigger.
 func (c *connection) Flush() error {
-	if !c.IsActive() || !c.lock(flushing) {
+	if !c.IsActive() {
 		return Exception(ErrConnClosed, "when flush")
 	}
+
+	if !c.lock(flushing) {
+		return Exception(ErrConcurrentAccess, "when flush")
+	}
 	defer c.unlock(flushing)
+
 	c.outputBuffer.Flush()
 	return c.flush()
 }
@@ -267,8 +293,12 @@ func (c *connection) Read(p []byte) (n int, err error) {
 
 // Write will Flush soon.
 func (c *connection) Write(p []byte) (n int, err error) {
-	if !c.IsActive() || !c.lock(flushing) {
+	if !c.IsActive() {
 		return 0, Exception(ErrConnClosed, "when write")
+	}
+
+	if !c.lock(flushing) {
+		return 0, Exception(ErrConcurrentAccess, "when write")
 	}
 	defer c.unlock(flushing)
 
@@ -284,6 +314,12 @@ func (c *connection) Close() error {
 	return c.onClose()
 }
 
+// Detach detaches the connection from poller but doesn't close it.
+func (c *connection) Detach() error {
+	c.detaching = true
+	return c.onClose()
+}
+
 // ------------------------------------------ private ------------------------------------------
 
 var barrierPool = sync.Pool{
@@ -295,14 +331,15 @@ var barrierPool = sync.Pool{
 	},
 }
 
-// init initialize the connection with options
+// init initializes the connection with options
 func (c *connection) init(conn Conn, opts *options) (err error) {
 	// init buffer, barrier, finalizer
-	c.readTrigger = make(chan struct{}, 1)
+	c.readTrigger = make(chan error, 1)
 	c.writeTrigger = make(chan error, 1)
-	c.bookSize, c.maxSize = block1k/2, pagesize
-	c.inputBuffer, c.outputBuffer = NewLinkBuffer(pagesize), NewLinkBuffer()
-	c.inputBarrier, c.outputBarrier = barrierPool.Get().(*barrier), barrierPool.Get().(*barrier)
+	c.bookSize, c.maxSize = defaultLinkBufferSize, defaultLinkBufferSize
+	c.inputBuffer, c.outputBuffer = NewLinkBuffer(defaultLinkBufferSize), NewLinkBuffer()
+	c.outputBarrier = barrierPool.Get().(*barrier)
+	c.state = connStateNone
 
 	c.initNetFD(conn) // conn must be *netFD{}
 	c.initFDOperator()
@@ -336,32 +373,30 @@ func (c *connection) initNetFD(conn Conn) {
 }
 
 func (c *connection) initFDOperator() {
-	op := allocop()
+	poll := pollmanager.Pick()
+	op := poll.Alloc()
 	op.FD = c.fd
 	op.OnRead, op.OnWrite, op.OnHup = nil, nil, c.onHup
 	op.Inputs, op.InputAck = c.inputs, c.inputAck
 	op.Outputs, op.OutputAck = c.outputs, c.outputAck
-
-	// if connection has been registered, must reuse poll here.
-	if c.pd != nil && c.pd.operator != nil {
-		op.poll = c.pd.operator.poll
-	}
 	c.operator = op
 }
 
 func (c *connection) initFinalizer() {
-	c.AddCloseCallback(func(connection Connection) error {
+	c.AddCloseCallback(func(connection Connection) (err error) {
 		c.stop(flushing)
-		c.netFD.Close()
+		c.operator.Free()
+		if err = c.netFD.Close(); err != nil {
+			logger.Printf("NETPOLL: netFD close failed: %v", err)
+		}
 		c.closeBuffer()
-		freeop(c.operator)
 		return nil
 	})
 }
 
-func (c *connection) triggerRead() {
+func (c *connection) triggerRead(err error) {
 	select {
-	case c.readTrigger <- struct{}{}:
+	case c.readTrigger <- err:
 	default:
 	}
 }
@@ -378,22 +413,24 @@ func (c *connection) waitRead(n int) (err error) {
 	if n <= c.inputBuffer.Len() {
 		return nil
 	}
-	atomic.StoreInt32(&c.waitReadSize, int32(n))
-	defer atomic.StoreInt32(&c.waitReadSize, 0)
+	atomic.StoreInt64(&c.waitReadSize, int64(n))
+	defer atomic.StoreInt64(&c.waitReadSize, 0)
 	if c.readTimeout > 0 {
 		return c.waitReadWithTimeout(n)
 	}
 	// wait full n
 	for c.inputBuffer.Len() < n {
-		if c.IsActive() {
-			<-c.readTrigger
-			continue
+		switch c.status(closing) {
+		case poller:
+			return Exception(ErrEOF, "wait read")
+		case user:
+			return Exception(ErrConnClosed, "wait read")
+		default:
+			err = <-c.readTrigger
+			if err != nil {
+				return err
+			}
 		}
-		// confirm that fd is still valid.
-		if atomic.LoadUint32(&c.netFD.closed) == 0 {
-			return c.fill(n)
-		}
-		return Exception(ErrConnClosed, "wait read")
 	}
 	return nil
 }
@@ -408,29 +445,32 @@ func (c *connection) waitReadWithTimeout(n int) (err error) {
 	}
 
 	for c.inputBuffer.Len() < n {
-		if !c.IsActive() {
-			// cannot return directly, stop timer before !
-			// confirm that fd is still valid.
-			if atomic.LoadUint32(&c.netFD.closed) == 0 {
-				err = c.fill(n)
-			} else {
-				err = Exception(ErrConnClosed, "wait read")
+		switch c.status(closing) {
+		case poller:
+			// cannot return directly, stop timer first!
+			err = Exception(ErrEOF, "wait read")
+			goto RET
+		case user:
+			// cannot return directly, stop timer first!
+			err = Exception(ErrConnClosed, "wait read")
+			goto RET
+		default:
+			select {
+			case <-c.readTimer.C:
+				// double check if there is enough data to be read
+				if c.inputBuffer.Len() >= n {
+					return nil
+				}
+				return Exception(ErrReadTimeout, c.remoteAddr.String())
+			case err = <-c.readTrigger:
+				if err != nil {
+					goto RET
+				}
+				continue
 			}
-			break
-		}
-
-		select {
-		case <-c.readTimer.C:
-			// double check if there is enough data to be read
-			if c.inputBuffer.Len() >= n {
-				return nil
-			}
-			return Exception(ErrReadTimeout, c.remoteAddr.String())
-		case <-c.readTrigger:
-			continue
 		}
 	}
-
+RET:
 	// clean timer.C
 	if !c.readTimer.Stop() {
 		<-c.readTimer.C
@@ -438,29 +478,76 @@ func (c *connection) waitReadWithTimeout(n int) (err error) {
 	return err
 }
 
-// fill data after connection is closed.
-func (c *connection) fill(need int) (err error) {
-	var n int
-	for {
-		n, err = readv(c.fd, c.inputs(c.inputBarrier.bs), c.inputBarrier.ivs)
-		c.inputAck(n)
-		err = c.eofError(n, err)
+// flush writes data directly.
+func (c *connection) flush() error {
+	if c.outputBuffer.IsEmpty() {
+		return nil
+	}
+	// TODO: Let the upper layer pass in whether to use ZeroCopy.
+	bs := c.outputBuffer.GetBytes(c.outputBarrier.bs)
+	n, err := sendmsg(c.fd, bs, c.outputBarrier.ivs, false && c.supportZeroCopy)
+	if err != nil && err != syscall.EAGAIN {
+		return Exception(err, "when flush")
+	}
+	if n > 0 {
+		err = c.outputBuffer.Skip(n)
+		c.outputBuffer.Release()
 		if err != nil {
-			break
+			return Exception(err, "when flush")
 		}
 	}
-	if c.inputBuffer.Len() >= need {
+	// return if write all buffer.
+	if c.outputBuffer.IsEmpty() {
 		return nil
 	}
-	return err
+	err = c.operator.Control(PollR2RW)
+	if err != nil {
+		return Exception(err, "when flush")
+	}
+
+	return c.waitFlush()
 }
 
-func (c *connection) eofError(n int, err error) error {
-	if err == syscall.EINTR {
-		return nil
+func (c *connection) waitFlush() (err error) {
+	if c.writeTimeout == 0 {
+		return <-c.writeTrigger
 	}
-	if n == 0 && err == nil {
-		return Exception(ErrEOF, "")
+
+	// set write timeout
+	if c.writeTimer == nil {
+		c.writeTimer = time.NewTimer(c.writeTimeout)
+	} else {
+		c.writeTimer.Reset(c.writeTimeout)
 	}
-	return err
+
+	select {
+	case err = <-c.writeTrigger:
+		if !c.writeTimer.Stop() { // clean timer
+			<-c.writeTimer.C
+		}
+		return err
+	case <-c.writeTimer.C:
+		select {
+		// try fetch writeTrigger if both cases fires
+		case err = <-c.writeTrigger:
+			return err
+		default:
+		}
+		// if timeout, remove write event from poller
+		// we cannot flush it again, since we don't if the poller is still process outputBuffer
+		c.operator.Control(PollRW2R)
+		return Exception(ErrWriteTimeout, c.remoteAddr.String())
+	}
+}
+
+func (c *connection) getState() connState {
+	return atomic.LoadInt32(&c.state)
+}
+
+func (c *connection) setState(newState connState) {
+	atomic.StoreInt32(&c.state, newState)
+}
+
+func (c *connection) changeState(from, to connState) bool {
+	return atomic.CompareAndSwapInt32(&c.state, from, to)
 }

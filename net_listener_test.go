@@ -1,4 +1,4 @@
-// Copyright 2021 CloudWeGo Authors
+// Copyright 2022 CloudWeGo Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build darwin || netbsd || freebsd || openbsd || dragonfly || linux
+// +build darwin netbsd freebsd openbsd dragonfly linux
+
 package netpoll
 
 import (
@@ -24,30 +27,21 @@ import (
 
 func TestListenerDialer(t *testing.T) {
 	network := "tcp"
-	addr := ":1234"
+	addr := getTestAddress()
 	ln, err := CreateListener(network, addr)
 	MustNil(t, err)
-	defer time.Sleep(10 * time.Millisecond)
 	defer ln.Close()
-
-	stop := make(chan int)
 	trigger := make(chan int)
-	defer close(stop)
-	defer close(trigger)
 	msg := []byte("0123456789")
 
 	go func() {
 		for {
-			select {
-			case <-stop:
-				err := ln.Close()
-				MustNil(t, err)
-				return
-			default:
-			}
 			conn, err := ln.Accept()
 			if conn == nil && err == nil {
 				continue
+			}
+			if err != nil {
+				return
 			}
 			go func(conn net.Conn) {
 				<-trigger

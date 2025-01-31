@@ -1,4 +1,4 @@
-// Copyright 2021 CloudWeGo Authors
+// Copyright 2022 CloudWeGo Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build darwin || netbsd || freebsd || openbsd || dragonfly || linux
 // +build darwin netbsd freebsd openbsd dragonfly linux
 
 package netpoll
@@ -22,14 +23,6 @@ import (
 	"os"
 	"syscall"
 )
-
-// Listener extends net.Listener, but supports getting the listener's fd.
-type Listener interface {
-	net.Listener
-
-	// Fd return listener's fd, used by poll.
-	Fd() (fd int)
-}
 
 // CreateListener return a new Listener.
 func CreateListener(network, addr string) (l Listener, err error) {
@@ -96,14 +89,22 @@ func (ln *listener) Accept() (net.Conn, error) {
 		return ln.UDPAccept()
 	}
 	// tcp
-	var fd, sa, err = syscall.Accept(ln.fd)
+	fd, sa, err := syscall.Accept(ln.fd)
 	if err != nil {
-		if err == syscall.EAGAIN {
+		/* https://man7.org/linux/man-pages/man2/accept.2.html
+		EAGAIN or EWOULDBLOCK
+		  The socket is marked nonblocking and no connections are
+		  present to be accepted.  POSIX.1-2001 and POSIX.1-2008
+		  allow either error to be returned for this case, and do
+		  not require these constants to have the same value, so a
+		  portable application should check for both possibilities.
+		*/
+		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
 			return nil, nil
 		}
 		return nil, err
 	}
-	var nfd = &netFD{}
+	nfd := &netFD{}
 	nfd.fd = fd
 	nfd.localAddr = ln.addr
 	nfd.network = ln.addr.Network()

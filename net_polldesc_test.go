@@ -1,4 +1,4 @@
-// Copyright 2021 CloudWeGo Authors
+// Copyright 2022 CloudWeGo Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !windows
+// +build !windows
+
 package netpoll
 
 import (
@@ -24,7 +27,8 @@ func TestZeroTimer(t *testing.T) {
 }
 
 func TestRuntimePoll(t *testing.T) {
-	ln, err := CreateListener("tcp", ":1234")
+	address := getTestAddress()
+	ln, err := CreateListener("tcp", address)
 	MustNil(t, err)
 
 	stop := make(chan int, 1)
@@ -47,7 +51,7 @@ func TestRuntimePoll(t *testing.T) {
 	}()
 
 	for i := 0; i < 10; i++ {
-		conn, err := DialConnection("tcp", ":1234", time.Second)
+		conn, err := DialConnection("tcp", address, time.Second)
 		MustNil(t, err)
 		conn.Close()
 	}

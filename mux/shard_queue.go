@@ -1,4 +1,4 @@
-// Copyright 2021 CloudWeGo Authors
+// Copyright 2022 CloudWeGo Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,13 +15,13 @@
 package mux
 
 import (
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
 
-	"github.com/bytedance/gopkg/util/gopool"
-
 	"github.com/cloudwego/netpoll"
+	"github.com/cloudwego/netpoll/internal/runner"
 )
 
 /* DOC:
@@ -71,17 +71,28 @@ type ShardQueue struct {
 	queueTrigger
 }
 
+const (
+	// queueTrigger state
+	active  = 0
+	closing = 1
+	closed  = 2
+)
+
 // here for trigger
 type queueTrigger struct {
 	trigger  int32
+	state    int32 // 0: active, 1: closing, 2: closed
 	runNum   int32
-	list     []int32    // record the triggered shard
 	w, r     int32      // ptr of list
+	list     []int32    // record the triggered shard
 	listLock sync.Mutex // list total lock
 }
 
 // Add adds to q.getters[shard]
 func (q *ShardQueue) Add(gts ...WriterGetter) {
+	if atomic.LoadInt32(&q.state) != active {
+		return
+	}
 	shard := atomic.AddInt32(&q.idx, 1) % q.size
 	q.lock(shard)
 	trigger := len(q.getters[shard]) == 0
@@ -90,6 +101,21 @@ func (q *ShardQueue) Add(gts ...WriterGetter) {
 	if trigger {
 		q.triggering(shard)
 	}
+}
+
+func (q *ShardQueue) Close() error {
+	if !atomic.CompareAndSwapInt32(&q.state, active, closing) {
+		return fmt.Errorf("shardQueue has been closed")
+	}
+	// wait for all tasks finished
+	for atomic.LoadInt32(&q.state) != closed {
+		if atomic.LoadInt32(&q.trigger) == 0 {
+			atomic.StoreInt32(&q.state, closed)
+			return nil
+		}
+		runtime.Gosched()
+	}
+	return nil
 }
 
 // triggering shard.
@@ -110,7 +136,7 @@ func (q *ShardQueue) foreach() {
 	if atomic.AddInt32(&q.runNum, 1) > 1 {
 		return
 	}
-	gopool.CtxGo(nil, func() {
+	runner.RunTask(nil, func() {
 		var negNum int32 // is negative number of triggerNum
 		for triggerNum := atomic.LoadInt32(&q.trigger); triggerNum > 0; {
 			q.r = (q.r + 1) % q.size
@@ -137,7 +163,10 @@ func (q *ShardQueue) foreach() {
 		atomic.StoreInt32(&q.runNum, 0)
 		if atomic.LoadInt32(&q.trigger) > 0 {
 			q.foreach()
+			return
 		}
+		// if state is closing, change it to closed
+		atomic.CompareAndSwapInt32(&q.state, closing, closed)
 	})
 }
 

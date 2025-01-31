@@ -3,7 +3,7 @@
 // license that can be found in the LICENSE file.
 //
 // This file may have been modified by CloudWeGo authors. (“CloudWeGo Modifications”).
-// All CloudWeGo Modifications are Copyright 2021 CloudWeGo authors.
+// All CloudWeGo Modifications are Copyright 2022 CloudWeGo authors.
 
 //go:build aix || darwin || dragonfly || freebsd || linux || nacl || netbsd || openbsd || solaris
 // +build aix darwin dragonfly freebsd linux nacl netbsd openbsd solaris
@@ -20,14 +20,9 @@ import (
 	"time"
 )
 
-var (
-	// aLongTimeAgo is a non-zero time, far in the past, used for
-	// immediate cancelation of dials.
-	aLongTimeAgo = time.Unix(1, 0)
-	// nonDeadline and noCancel are just zero values for
-	// readability with functions taking too many parameters.
-	noDeadline = time.Time{}
-)
+// nonDeadline and noCancel are just zero values for
+// readability with functions taking too many parameters.
+var noDeadline = time.Time{}
 
 type netFD struct {
 	// file descriptor
@@ -50,10 +45,12 @@ type netFD struct {
 	network       string // tcp tcp4 tcp6, udp, udp4, udp6, ip, ip4, ip6, unix, unixgram, unixpacket
 	localAddr     net.Addr
 	remoteAddr    net.Addr
+	// for detaching conn from poller
+	detaching bool
 }
 
 func newNetFD(fd, family, sotype int, net string) *netFD {
-	var ret = &netFD{}
+	ret := &netFD{}
 	ret.fd = fd
 	ret.network = net
 	ret.family = family
@@ -107,7 +104,7 @@ func (c *netFD) dial(ctx context.Context, laddr, raddr sockaddr) (err error) {
 	return nil
 }
 
-func (c *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa syscall.Sockaddr, ret error) {
+func (c *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa syscall.Sockaddr, retErr error) {
 	// Do not need to call c.writing here,
 	// because c is not yet accessible to user,
 	// so no concurrent operations are possible.
@@ -134,46 +131,12 @@ func (c *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa sysca
 		return nil, os.NewSyscallError("connect", err)
 	}
 
-	// TODO: can't support interrupter now.
-	// Start the "interrupter" goroutine, if this context might be canceled.
-	// (The background context cannot)
-	//
-	// The interrupter goroutine waits for the context to be done and
-	// interrupts the dial (by altering the c's write deadline, which
-	// wakes up waitWrite).
-	if ctx != context.Background() {
-		// Wait for the interrupter goroutine to exit before returning
-		// from connect.
-		done := make(chan struct{})
-		interruptRes := make(chan error)
-		defer func() {
-			close(done)
-			if ctxErr := <-interruptRes; ctxErr != nil && ret == nil {
-				// The interrupter goroutine called SetWriteDeadline,
-				// but the connect code below had returned from
-				// waitWrite already and did a successful connect (ret
-				// == nil). Because we've now poisoned the connection
-				// by making it unwritable, don't return a successful
-				// dial. This was issue 16523.
-				ret = mapErr(ctxErr)
-				c.Close() // prevent a leak
-			}
-		}()
-		go func() {
-			select {
-			case <-ctx.Done():
-				// Force the runtime's poller to immediately give up
-				// waiting for writability, unblocking waitWrite
-				// below.
-				c.SetWriteDeadline(aLongTimeAgo)
-				interruptRes <- ctx.Err()
-			case <-done:
-				interruptRes <- nil
-			}
-		}()
-	}
-
 	c.pd = newPollDesc(c.fd)
+	defer func() {
+		// free operator to avoid leak
+		c.pd.operator.Free()
+		c.pd = nil
+	}()
 	for {
 		// Performing multiple connect system calls on a
 		// non-blocking socket under Unix variants does not
